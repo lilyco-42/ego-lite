@@ -171,11 +171,80 @@ test("clipboard transactions are serialized within one runtime", async () => {
   ]);
 });
 
-test("paste explains the supported clipboard platforms", async () => {
-  await assert.rejects(
-    () => __testing.beginNativeClipboardTransaction("temporary", "linux"),
-    /requires macOS or Windows clipboard support.*insertText/,
+test("paste explains the Linux clipboard requirement", () => {
+  assert.throws(
+    () => __testing.detectLinuxClipboardTool({ PATH: "/definitely/not/here" }),
+    /wl-clipboard|xclip|xsel.*insertText/,
   );
+});
+
+test("paste explains unsupported platforms", async () => {
+  await assert.rejects(
+    () => __testing.beginNativeClipboardTransaction("temporary", "aix"),
+    /not supported on aix.*insertText/,
+  );
+});
+
+function fakeLinuxClipboard(initial) {
+  let value = initial;
+  const calls = [];
+  return {
+    calls,
+    get value() {
+      return value;
+    },
+    set value(next) {
+      value = next;
+    },
+    tool: {
+      name: "fake",
+      async read() {
+        calls.push("read");
+        return value;
+      },
+      async write(text) {
+        calls.push(`write:${text}`);
+        value = text;
+      },
+      async clear() {
+        calls.push("clear");
+        value = null;
+      },
+    },
+  };
+}
+
+test("Linux paste restores the previous clipboard text", async () => {
+  const fake = fakeLinuxClipboard("previous");
+  const transaction = await __testing.beginLinuxClipboardTransaction(
+    "temporary",
+    { tool: fake.tool, delay: async () => {} },
+  );
+  assert.equal(fake.value, "temporary");
+  assert.equal(await transaction.finish(), "restored");
+  assert.equal(fake.value, "previous");
+});
+
+test("Linux paste clears an empty previous clipboard", async () => {
+  const fake = fakeLinuxClipboard(null);
+  const transaction = await __testing.beginLinuxClipboardTransaction(
+    "temporary",
+    { tool: fake.tool, delay: async () => {} },
+  );
+  assert.equal(await transaction.finish(), "restored");
+  assert.equal(fake.value, null);
+  assert.ok(fake.calls.includes("clear"));
+});
+
+test("Linux paste leaves a clipboard taken over by another process", async () => {
+  const fake = fakeLinuxClipboard("previous");
+  const transaction = await __testing.beginLinuxClipboardTransaction(
+    "temporary",
+    { tool: fake.tool, delay: async () => {} },
+  );
+  fake.value = "someone else";
+  assert.equal(await transaction.finish(), "changed");
+  assert.equal(fake.value, "someone else");
 });
 
 test("Windows HTML clipboard offsets count UTF-8 bytes", () => {

@@ -1,9 +1,11 @@
 import {
+  execFile,
   spawn,
   type ChildProcess,
   type SpawnOptions,
 } from "node:child_process";
-import { win32 } from "node:path";
+import { accessSync, constants } from "node:fs";
+import { join, win32 } from "node:path";
 import type { Writable } from "node:stream";
 
 export type ClipboardTransactionStatus = "restored" | "changed";
@@ -114,14 +116,216 @@ export async function withTemporaryClipboardContent<T>(
 function beginNativeClipboardTransaction(
   input: ClipboardInput,
   platform: string = process.platform,
+  linuxOptions: LinuxClipboardOptions = {},
 ): Promise<ClipboardTransaction> {
   if (platform === "darwin") return beginDarwinClipboardTransaction(input);
   if (platform === "win32") return beginWin32ClipboardTransaction(input);
+  if (platform === "linux")
+    return beginLinuxClipboardTransaction(input, linuxOptions);
   return Promise.reject(
     new Error(
-      "page.keyboard.paste requires macOS or Windows clipboard support; use page.keyboard.insertText() for plain text",
+      `page.keyboard.paste is not supported on ${platform}; use page.keyboard.insertText() for plain text`,
     ),
   );
+}
+
+type LinuxClipboardTool = {
+  /** Tool family name, used in error messages. */
+  name: string;
+  read(): Promise<string | null>;
+  write(text: string): Promise<void>;
+  clear(): Promise<void>;
+};
+
+type LinuxClipboardOptions = {
+  tool?: LinuxClipboardTool;
+  delay?: (milliseconds: number) => Promise<void>;
+};
+
+/**
+ * Run one paste while a text value is on the Linux clipboard, then put the
+ * previous text back. Linux has no portable change counter, so the current
+ * value is compared with the temporary one before restoring: a different value
+ * means another process took over the clipboard and is reported as `changed`.
+ *
+ * Only plain text is supported; an `html` representation is ignored because
+ * wl-copy, xclip, and xsel each publish a single flavor at a time.
+ */
+async function beginLinuxClipboardTransaction(
+  input: ClipboardInput,
+  options: LinuxClipboardOptions = {},
+): Promise<ClipboardTransaction> {
+  const content = typeof input === "string" ? { text: input } : input;
+  const tool = options.tool ?? detectLinuxClipboardTool();
+  const delay =
+    options.delay ??
+    ((milliseconds: number) =>
+      new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
+
+  let previous: string | null;
+  try {
+    previous = await tool.read();
+    await tool.write(content.text);
+  } catch (error) {
+    throw new Error(
+      `could not prepare the Linux clipboard with ${tool.name}: ${String(
+        (error as Error).message || error,
+      )}`,
+    );
+  }
+  // wl-copy hands the payload to a short-lived owner process; give it a moment
+  // to publish before the caller reads the clipboard back.
+  await delay(50);
+
+  return {
+    async finish() {
+      let current: string | null;
+      try {
+        current = await tool.read();
+      } catch (error) {
+        throw new Error(
+          `could not read the Linux clipboard with ${tool.name}: ${String(
+            (error as Error).message || error,
+          )}`,
+        );
+      }
+      if (current !== content.text) return "changed";
+      try {
+        if (previous === null) await tool.clear();
+        else await tool.write(previous);
+      } catch (error) {
+        throw new Error(
+          `could not restore the Linux clipboard with ${tool.name}: ${String(
+            (error as Error).message || error,
+          )}`,
+        );
+      }
+      return "restored";
+    },
+  };
+}
+
+/**
+ * Pick the clipboard tool that matches the session: wl-clipboard on Wayland,
+ * then xclip, then xsel. Nothing is guessed when no tool is installed.
+ */
+function detectLinuxClipboardTool(
+  env: NodeJS.ProcessEnv = process.env,
+): LinuxClipboardTool {
+  const onPath = (name: string) => {
+    const searchPath = env.PATH ?? "";
+    for (const directory of searchPath.split(":")) {
+      if (!directory) continue;
+      try {
+        accessSync(join(directory, name), constants.X_OK);
+        return true;
+      } catch {
+        // keep looking
+      }
+    }
+    return false;
+  };
+
+  if (env.WAYLAND_DISPLAY && onPath("wl-copy") && onPath("wl-paste")) {
+    return waylandClipboardTool();
+  }
+  if (onPath("xclip")) return xclipClipboardTool();
+  if (onPath("xsel")) return xselClipboardTool();
+
+  throw new Error(
+    "page.keyboard.paste on Linux requires wl-clipboard (wl-copy/wl-paste), xclip, or xsel; use page.keyboard.insertText() for plain text",
+  );
+}
+
+function waylandClipboardTool(): LinuxClipboardTool {
+  return {
+    name: "wl-clipboard",
+    async read() {
+      const result = await runClipboardCommand("wl-paste", ["--no-newline"]);
+      return result.code === 0 ? result.stdout : null;
+    },
+    async write(text) {
+      await runClipboardCommand("wl-copy", [], text);
+    },
+    async clear() {
+      await runClipboardCommand("wl-copy", ["--clear"]);
+    },
+  };
+}
+
+function xclipClipboardTool(): LinuxClipboardTool {
+  return {
+    name: "xclip",
+    async read() {
+      const result = await runClipboardCommand("xclip", [
+        "-o",
+        "-selection",
+        "clipboard",
+      ]);
+      return result.code === 0 ? result.stdout : null;
+    },
+    async write(text) {
+      await runClipboardCommand(
+        "xclip",
+        ["-selection", "clipboard", "-in"],
+        text,
+      );
+    },
+    async clear() {
+      await runClipboardCommand(
+        "xclip",
+        ["-selection", "clipboard", "-in"],
+        "",
+      );
+    },
+  };
+}
+
+function xselClipboardTool(): LinuxClipboardTool {
+  return {
+    name: "xsel",
+    async read() {
+      const result = await runClipboardCommand("xsel", [
+        "--clipboard",
+        "--output",
+      ]);
+      return result.code === 0 ? result.stdout : null;
+    },
+    async write(text) {
+      await runClipboardCommand("xsel", ["--clipboard", "--input"], text);
+    },
+    async clear() {
+      await runClipboardCommand("xsel", ["--clipboard", "--input"], "");
+    },
+  };
+}
+
+function runClipboardCommand(
+  command: string,
+  args: string[],
+  input?: string,
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    const child = execFile(
+      command,
+      args,
+      { encoding: "utf8", timeout: 5_000, maxBuffer: 1 << 20 },
+      (error, stdout, stderr) => {
+        const code =
+          error && typeof (error as { code?: unknown }).code === "number"
+            ? (error as { code: number }).code
+            : error
+              ? 1
+              : 0;
+        resolve({
+          code,
+          stdout: String(stdout ?? ""),
+          stderr: String(stderr ?? ""),
+        });
+      },
+    );
+    if (input !== undefined) child.stdin?.end(input);
+  });
 }
 
 type ClipboardHost = {
@@ -669,6 +873,8 @@ const WIN32_CLIPBOARD_HOST_COMMAND = Buffer.from(
 
 export const __testing = {
   beginNativeClipboardTransaction,
+  beginLinuxClipboardTransaction,
+  detectLinuxClipboardTool,
   beginWin32ClipboardTransaction,
   windowsHtmlClipboardFormat,
   WIN32_CLIPBOARD_HOST,
